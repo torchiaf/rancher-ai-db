@@ -57,14 +57,6 @@ def tables_init():
         conn.commit()
     conn.close()
 
-# def insert_session(session_id, user_id):
-#     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
-#     with conn.cursor() as cur:
-#         cur.execute("UPDATE sessions SET active=FALSE WHERE user_id=%s", user_id)
-#         cur.execute("INSERT INTO sessions (session_id, user_id, active) VALUES (%s, %s, TRUE)", (session_id, user_id))
-#         conn.commit()
-#     conn.close()
-
 def insert_or_update_message(session_id, request_id, role, text, timestamp=None):
     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
     with conn.cursor() as cur:
@@ -79,15 +71,10 @@ def insert_or_update_message(session_id, request_id, role, text, timestamp=None)
         conn.commit()
     conn.close()
 
-# def update_session_active(session_id, user_id, active):
-#     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
-#     with conn.cursor() as cur:
-#         cur.execute("UPDATE sessions SET active=FALSE WHERE user_id=%s", user_id)
-#         cur.execute("UPDATE sessions SET active=%s WHERE session_id=%s", (active, session_id))
-#         conn.commit()
-#     conn.close()
-
 def run():
+    LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+    logging.getLogger().setLevel(LOG_LEVEL)
+
     logger.info("Initializing DB supervisor...")
 
     wait_for_db()
