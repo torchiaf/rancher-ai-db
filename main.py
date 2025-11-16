@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_CHANNEL = os.getenv("REDIS_CHANNEL", "channel:history:s-*:r-*")
+REDIS_MESSAGE_CHANNEL = os.getenv("REDIS_MESSAGE_CHANNEL", "channel:history:s-*:r-*")
+REDIS_SESSION_CHANNEL = os.getenv("REDIS_SESSION_CHANNEL", "channel:sessions:u-*")
 
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
@@ -39,6 +40,7 @@ def tables_init():
                 session_id VARCHAR(255),
                 user_id VARCHAR(255),
                 active BOOLEAN DEFAULT TRUE,
+                name VARCHAR(255) DEFAULT "",
                 created_at NUMERIC(20),
                 UNIQUE KEY ux_session_user (session_id, user_id),
                 INDEX idx_user_id (user_id)
@@ -57,19 +59,48 @@ def tables_init():
         conn.commit()
     conn.close()
 
+def insert_or_update_session(session_id, user_id, active=True, name="", timestamp=None):
+    conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sessions (session_id, user_id, active, name, created_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE active=%s, name=%s",
+                (session_id, user_id, active, name, timestamp, active, name)
+            )
+
+            conn.commit()
+    finally:
+        conn.close()
+
 def insert_or_update_message(session_id, request_id, role, text, timestamp=None):
     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
-    with conn.cursor() as cur:
-        # Insert or update message by appending text
-        cur.execute(
-            "INSERT INTO messages (session_id, request_id, role, message, created_at) "
-            "VALUES (%s, %s, %s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE role=%s, message=CONCAT(COALESCE(message,''), %s), created_at=%s",
-            (session_id, request_id, role, text, timestamp, role, text, timestamp)
-        )
+    try:
+        with conn.cursor() as cur:
+            # Insert or update message by appending text
+            cur.execute(
+                "INSERT INTO messages (session_id, request_id, role, message, created_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE role=%s, message=CONCAT(COALESCE(message,''), %s), created_at=%s",
+                (session_id, request_id, role, text, timestamp, role, text, timestamp)
+            )
 
         conn.commit()
-    conn.close()
+    finally:
+        conn.close()
+
+def _get_previous_session_for_user(r, user_id):
+    key = f"sessions:u-{user_id}"
+    try:
+        vals = r.lrange(key, 0, -1)
+
+        if len(vals) >= 2:
+            return json.loads(vals[-2])
+    except Exception as e:
+        logger.debug("Error reading previous session for user %s: %s", user_id, e)
+
+    return None
 
 def run():
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
@@ -82,29 +113,85 @@ def run():
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     pub = r.pubsub(ignore_subscribe_messages=True)
 
-    # Use pattern subscribe to match parametric channels like history:s-<session_id>:r-<request_id>
-    pub.psubscribe(REDIS_CHANNEL)
-    logger.info("PSubscribed to pattern: %s", REDIS_CHANNEL)
+    # Subscribe patterns on the same PubSub
+    pub.psubscribe(REDIS_MESSAGE_CHANNEL)
+    logger.info("PSubscribed to pattern: %s", REDIS_MESSAGE_CHANNEL)
+    pub.psubscribe(REDIS_SESSION_CHANNEL)
+    logger.info("PSubscribed to pattern: %s", REDIS_SESSION_CHANNEL)
 
-    key_pattern = re.compile(r"^channel:history:s-(?P<session>[^:]+):r-(?P<request>.+)$")
+    key_pattern_msg = re.compile(r"^channel:history:s-(?P<session>[^:]+):r-(?P<request>.+)$")
+    key_pattern_session = re.compile(r"^channel:sessions:u-(?P<user>.+)$")
+
     for item in pub.listen():
-        logger.debug("Message received from channel pattern %s: %s", REDIS_CHANNEL, item)
-        match = key_pattern.match(item.get("channel", "") or "")
-        if match:
-            session_id = match.group("session")
-            request_id = match.group("request")
-            logger.debug("Extracted session_id: %s request_id: %s", session_id, request_id)
+        logger.debug("Received pubsub item: %s", item)
+        try:
+            itype = item.get("type")
+            if itype not in ("pmessage", "message"):
+                continue
 
-            try:
-                payload = json.loads(item.get("data", "{}"))
-            except Exception:
-                payload = {}
-            if payload:
+            channel = item.get("channel", "") or ""
+
+            # Message channel
+            m = key_pattern_msg.match(channel)
+            if m:
+                session_id = m.group("session")
+                request_id = m.group("request")
+                logger.debug("Message channel, extracted session_id: %s request_id: %s", session_id, request_id)
+
                 try:
-                    insert_or_update_message(session_id, request_id, payload.get("role"), payload.get("text"), payload.get("ts"))
-                    logger.debug("Updated message into DB: %s %s %s", session_id, request_id, payload)
-                except Exception as e:
-                    logger.error("DB insert failed: %s", e)
+                    payload = json.loads(item.get("data", "{}"))
+                except Exception:
+                    payload = {}
+                if payload:
+                    try:
+                        insert_or_update_message(session_id, request_id, payload.get("role"), payload.get("text"), payload.get("ts"))
+                        logger.debug("Updated message into DB: %s %s %s", session_id, request_id, payload)
+                    except Exception as e:
+                        logger.error("DB insert failed: %s", e)
+                continue
+
+            m2 = key_pattern_session.match(channel)
+            if m2:
+                user_id = m2.group("user")
+                logger.debug("Session channel, extracted user_id: %s", user_id)
+
+                try:
+                    payload = json.loads(item.get("data", "{}"))
+                except Exception:
+                    payload = {}
+
+                # Insert the new session from payload
+                session_id = payload.get("session_id")
+                if session_id:
+                    try:
+                        insert_or_update_session(session_id, user_id, active=payload.get("active", True), name=payload.get("name", ""), timestamp=payload.get("created_at"))
+                        logger.info("Inserted new session %s for user %s", session_id, user_id)
+                    
+                        # Update previous session to have a name (for testing, use a fixed name)
+                        # The name should be a summary calculated by the Agent based on the conversation
+                        prev_session = _get_previous_session_for_user(r, user_id)
+                        
+                        name_for_previous = "test"
+                        # TODO get name from DB not redis (aways empty name in redis)
+                        if prev_session and not prev_session.get("name", None) and name_for_previous:
+                            try:
+                                insert_or_update_session(prev_session["session_id"], user_id, active=True, name=name_for_previous, timestamp=prev_session["created_at"])
+                                logger.info("Updated previous session %s for user %s with name=%s", prev_session["session_id"], user_id, name_for_previous)
+                            except Exception as e:
+                                logger.error("Failed to update previous session in DB: %s", e)
+
+                    except Exception as e:
+                        logger.error("Failed to insert new session in DB: %s", e)
+                else:
+                    logger.debug("No session_id in payload; skipping new-session insert (payload=%s)", payload)
+
+                continue
+
+            # Otherwise ignore / debug
+            logger.debug("Ignored pubsub item on channel %s: %s", channel, item)
+
+        except Exception as e:
+            logger.exception("Error handling pubsub item: %s", e)
 
 if __name__ == "__main__":
     run()
