@@ -12,6 +12,6 @@ WORKDIR /app
 COPY main.py /app/main.py
 
 RUN python -m pip install --upgrade pip \
- && pip install --no-cache-dir redis pymysql cryptography
+ && pip install --no-cache-dir redis pymysql cryptography websockets asyncio
 
 CMD ["python", "/app/main.py"]

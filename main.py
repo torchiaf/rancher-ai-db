@@ -5,6 +5,8 @@ import re
 import logging
 import pymysql
 import redis
+import websockets
+import asyncio
 
 # configure logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -20,6 +22,9 @@ MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_ROOT_PASSWORD", os.getenv("MYSQL_PASSWORD", "rancher-ai"))
 MYSQL_DB = os.getenv("MYSQL_DATABASE", os.getenv("MYSQL_DB", "rancher-ai"))
+
+AGENT_WS_SUMMARY_URL = os.getenv("AGENT_WS_SUMMARY_URL", "ws://localhost:8000/agent/ws/summary")
+AGENT_WS_TIMEOUT = float(os.getenv("AGENT_WS_TIMEOUT", "5"))
 
 def wait_for_db():
     while True:
@@ -102,7 +107,83 @@ def _get_previous_session_for_user(r, user_id):
 
     return None
 
-def run():
+async def get_session_messages(session_id):
+    messages = []
+    if session_id:
+        # Fetch from DB
+        conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT message FROM messages WHERE session_id=%s ORDER BY created_at ASC",
+                    (session_id,)
+                )
+                rows = cur.fetchall()
+                
+                messages = [row[0] for row in rows]
+        finally:
+            conn.close()
+    return messages
+
+async def get_chat_summary(messages):
+    try:
+        async with websockets.connect(AGENT_WS_SUMMARY_URL) as ws:
+            text = "\n" + "\n".join(f"- {str(m)}" for m in messages) + "\n"
+
+            logger.info("Sending request to summary service %s", text)
+
+            await ws.send(text)
+
+            buffer = ""
+            end_time = asyncio.get_event_loop().time() + AGENT_WS_TIMEOUT
+            while True:
+                timeout = max(0.1, end_time - asyncio.get_event_loop().time())
+                try:
+                    chunk = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.debug("Timeout waiting for more chunks from summary service")
+                    break
+                except websockets.ConnectionClosedOK:
+                    logger.debug("WebSocket closed by server")
+                    break
+                except Exception as e:
+                    logger.debug("WebSocket recv error: %s", e)
+                    return None
+
+                if isinstance(chunk, (bytes, bytearray)):
+                    try:
+                        chunk = chunk.decode("utf-8", errors="ignore")
+                    except Exception:
+                        chunk = str(chunk)
+
+                buffer += chunk
+                logger.debug("< Chunk received (len=%d)", len(chunk))
+
+                if "</message>" in buffer:
+                    logger.debug("Terminator '</message>' found in buffer")
+                    break
+
+                if asyncio.get_event_loop().time() >= end_time:
+                    logger.debug("Overall deadline reached while waiting for terminator")
+                    break
+
+            # Try extract between <message>...</message>
+            m = re.search(r"<message>(.*?)</message>", buffer, re.DOTALL)
+            if m:
+                result = m.group(1).strip()
+            else:
+                # Fallback to full buffer
+                result = buffer.strip() if buffer else None
+
+            logger.debug("Final summary-service response=%s", result)
+
+            return result
+
+    except Exception as e:
+        logger.debug("WebSocket connect/send failed to %s: %s", AGENT_WS_SUMMARY_URL, e)
+        return None
+
+async def run():
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
     logging.getLogger().setLevel(LOG_LEVEL)
 
@@ -167,12 +248,20 @@ def run():
                         insert_or_update_session(session_id, user_id, active=payload.get("active", True), name=payload.get("name", ""), timestamp=payload.get("created_at"))
                         logger.info("Inserted new session %s for user %s", session_id, user_id)
                     
-                        # Update previous session to have a name (for testing, use a fixed name)
-                        # The name should be a summary calculated by the Agent based on the conversation
+                        # Check previous session for missing name
                         prev_session = _get_previous_session_for_user(r, user_id)
-                        
-                        name_for_previous = "test"
-                        # TODO get name from DB not redis (aways empty name in redis)
+
+                        # Try to get the chat summary from websocket summary service
+                        name_for_previous = None
+                        if prev_session:
+                            try:
+                                messages = await get_session_messages(prev_session["session_id"])
+                                if messages:
+                                    name_for_previous = await get_chat_summary(messages)
+                            except Exception as e:
+                                logger.debug("Failed to obtain name from websocket summary service: %s", e)
+
+                        # TODO prev_session.get("name", None) should be checked in the DB too
                         if prev_session and not prev_session.get("name", None) and name_for_previous:
                             try:
                                 insert_or_update_session(prev_session["session_id"], user_id, active=True, name=name_for_previous, timestamp=prev_session["created_at"])
@@ -194,4 +283,4 @@ def run():
             logger.exception("Error handling pubsub item: %s", e)
 
 if __name__ == "__main__":
-    run()
+   asyncio.run(run())
