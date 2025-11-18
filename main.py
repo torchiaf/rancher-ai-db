@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_MESSAGE_CHANNEL = os.getenv("REDIS_MESSAGE_CHANNEL", "channel:history:s-*:r-*")
-REDIS_SESSION_CHANNEL = os.getenv("REDIS_SESSION_CHANNEL", "channel:sessions:u-*")
+REDIS_MESSAGE_CHANNEL = os.getenv("REDIS_MESSAGE_CHANNEL", "channel:history:c-*:r-*")
+REDIS_CHAT_CHANNEL = os.getenv("REDIS_CHAT_CHANNEL", "channel:chats:u-*")
 
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
@@ -40,83 +40,83 @@ def tables_init():
     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
     with conn.cursor() as cur:
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
+            CREATE TABLE IF NOT EXISTS chats (
                 id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                session_id VARCHAR(255),
+                chat_id VARCHAR(255),
                 user_id VARCHAR(255),
                 active BOOLEAN DEFAULT TRUE,
                 name VARCHAR(255) DEFAULT "",
                 created_at NUMERIC(20),
-                UNIQUE KEY ux_session_user (session_id, user_id),
+                UNIQUE KEY ux_chat_user (chat_id, user_id),
                 INDEX idx_user_id (user_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
-                session_id VARCHAR(255),
+                chat_id VARCHAR(255),
                 request_id VARCHAR(255),
                 role VARCHAR(32),
                 message MEDIUMTEXT,
                 created_at NUMERIC(20),
-                PRIMARY KEY (session_id, request_id, role)
+                PRIMARY KEY (chat_id, request_id, role)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         conn.commit()
     conn.close()
 
-def insert_or_update_session(session_id, user_id, active=True, name="", timestamp=None):
+def insert_or_update_chat(chat_id, user_id, active=True, name="", timestamp=None):
     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO sessions (session_id, user_id, active, name, created_at) "
+                "INSERT INTO chats (chat_id, user_id, active, name, created_at) "
                 "VALUES (%s, %s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE active=%s, name=%s",
-                (session_id, user_id, active, name, timestamp, active, name)
+                (chat_id, user_id, active, name, timestamp, active, name)
             )
 
             conn.commit()
     finally:
         conn.close()
 
-def insert_or_update_message(session_id, request_id, role, text, timestamp=None):
+def insert_or_update_message(chat_id, request_id, role, text, timestamp=None):
     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
     try:
         with conn.cursor() as cur:
             # Insert or update message by appending text
             cur.execute(
-                "INSERT INTO messages (session_id, request_id, role, message, created_at) "
+                "INSERT INTO messages (chat_id, request_id, role, message, created_at) "
                 "VALUES (%s, %s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE role=%s, message=CONCAT(COALESCE(message,''), %s), created_at=%s",
-                (session_id, request_id, role, text, timestamp, role, text, timestamp)
+                (chat_id, request_id, role, text, timestamp, role, text, timestamp)
             )
 
         conn.commit()
     finally:
         conn.close()
 
-def _get_previous_session_for_user(r, user_id):
-    key = f"sessions:u-{user_id}"
+def _get_previous_chat_for_user(r, user_id):
+    key = f"chats:u-{user_id}"
     try:
         vals = r.lrange(key, 0, -1)
 
         if len(vals) >= 2:
             return json.loads(vals[-2])
     except Exception as e:
-        logger.debug("Error reading previous session for user %s: %s", user_id, e)
+        logger.debug("Error reading previous chat for user %s: %s", user_id, e)
 
     return None
 
-async def get_session_messages(session_id):
+async def get_chat_messages(chat_id):
     messages = []
-    if session_id:
+    if chat_id:
         # Fetch from DB
         conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT message FROM messages WHERE session_id=%s ORDER BY created_at ASC",
-                    (session_id,)
+                    "SELECT message FROM messages WHERE chat_id=%s ORDER BY created_at ASC",
+                    (chat_id,)
                 )
                 rows = cur.fetchall()
                 
@@ -157,17 +157,16 @@ async def get_chat_summary(messages):
                         chunk = str(chunk)
 
                 buffer += chunk
-                logger.debug("< Chunk received (len=%d)", len(chunk))
+                logger.debug("Message Chunk received (len=%d)", len(chunk))
 
                 if "</message>" in buffer:
                     logger.debug("Terminator '</message>' found in buffer")
                     break
 
                 if asyncio.get_event_loop().time() >= end_time:
-                    logger.debug("Overall deadline reached while waiting for terminator")
+                    logger.debug("Deadline reached while waiting for terminator")
                     break
 
-            # Try extract between <message>...</message>
             m = re.search(r"<message>(.*?)</message>", buffer, re.DOTALL)
             if m:
                 result = m.group(1).strip()
@@ -197,11 +196,11 @@ async def run():
     # Subscribe patterns on the same PubSub
     pub.psubscribe(REDIS_MESSAGE_CHANNEL)
     logger.info("PSubscribed to pattern: %s", REDIS_MESSAGE_CHANNEL)
-    pub.psubscribe(REDIS_SESSION_CHANNEL)
-    logger.info("PSubscribed to pattern: %s", REDIS_SESSION_CHANNEL)
+    pub.psubscribe(REDIS_CHAT_CHANNEL)
+    logger.info("PSubscribed to pattern: %s", REDIS_CHAT_CHANNEL)
 
-    key_pattern_msg = re.compile(r"^channel:history:s-(?P<session>[^:]+):r-(?P<request>.+)$")
-    key_pattern_session = re.compile(r"^channel:sessions:u-(?P<user>.+)$")
+    key_pattern_msg = re.compile(r"^channel:history:c-(?P<chat>[^:]+):r-(?P<request>.+)$")
+    key_pattern_chat = re.compile(r"^channel:chats:u-(?P<user>.+)$")
 
     for item in pub.listen():
         logger.debug("Received pubsub item: %s", item)
@@ -215,9 +214,9 @@ async def run():
             # Message channel
             m = key_pattern_msg.match(channel)
             if m:
-                session_id = m.group("session")
+                chat_id = m.group("chat")
                 request_id = m.group("request")
-                logger.debug("Message channel, extracted session_id: %s request_id: %s", session_id, request_id)
+                logger.debug("Message channel, extracted chat_id: %s request_id: %s", chat_id, request_id)
 
                 try:
                     payload = json.loads(item.get("data", "{}"))
@@ -225,54 +224,54 @@ async def run():
                     payload = {}
                 if payload:
                     try:
-                        insert_or_update_message(session_id, request_id, payload.get("role"), payload.get("text"), payload.get("ts"))
-                        logger.debug("Updated message into DB: %s %s %s", session_id, request_id, payload)
+                        insert_or_update_message(chat_id, request_id, payload.get("role"), payload.get("text"), payload.get("ts"))
+                        logger.debug("Updated message into DB: %s %s %s", chat_id, request_id, payload)
                     except Exception as e:
                         logger.error("DB insert failed: %s", e)
                 continue
 
-            m2 = key_pattern_session.match(channel)
+            m2 = key_pattern_chat.match(channel)
             if m2:
                 user_id = m2.group("user")
-                logger.debug("Session channel, extracted user_id: %s", user_id)
+                logger.debug("Chat channel, extracted user_id: %s", user_id)
 
                 try:
                     payload = json.loads(item.get("data", "{}"))
                 except Exception:
                     payload = {}
 
-                # Insert the new session from payload
-                session_id = payload.get("session_id")
-                if session_id:
+                # Insert the new chat from payload
+                chat_id = payload.get("chat_id")
+                if chat_id:
                     try:
-                        insert_or_update_session(session_id, user_id, active=payload.get("active", True), name=payload.get("name", ""), timestamp=payload.get("created_at"))
-                        logger.info("Inserted new session %s for user %s", session_id, user_id)
-                    
-                        # Check previous session for missing name
-                        prev_session = _get_previous_session_for_user(r, user_id)
+                        insert_or_update_chat(chat_id, user_id, active=payload.get("active", True), name=payload.get("name", ""), timestamp=payload.get("created_at"))
+                        logger.debug("Inserted new chat %s for user %s", chat_id, user_id)
+
+                        # Check previous chat for missing name
+                        prev_chat = _get_previous_chat_for_user(r, user_id)
 
                         # Try to get the chat summary from websocket summary service
                         name_for_previous = None
-                        if prev_session:
+                        if prev_chat:
                             try:
-                                messages = await get_session_messages(prev_session["session_id"])
+                                messages = await get_chat_messages(prev_chat["chat_id"])
                                 if messages:
                                     name_for_previous = await get_chat_summary(messages)
                             except Exception as e:
                                 logger.debug("Failed to obtain name from websocket summary service: %s", e)
 
-                        # TODO prev_session.get("name", None) should be checked in the DB too
-                        if prev_session and not prev_session.get("name", None) and name_for_previous:
+                        # TODO prev_chat.get("name", None) should be checked in the DB too
+                        if prev_chat and not prev_chat.get("name", None) and name_for_previous:
                             try:
-                                insert_or_update_session(prev_session["session_id"], user_id, active=True, name=name_for_previous, timestamp=prev_session["created_at"])
-                                logger.info("Updated previous session %s for user %s with name=%s", prev_session["session_id"], user_id, name_for_previous)
+                                insert_or_update_chat(prev_chat["chat_id"], user_id, active=True, name=name_for_previous, timestamp=prev_chat["created_at"])
+                                logger.info("Updated previous chat %s for user %s with name=%s", prev_chat["chat_id"], user_id, name_for_previous)
                             except Exception as e:
-                                logger.error("Failed to update previous session in DB: %s", e)
+                                logger.error("Failed to update previous chat in DB: %s", e)
 
                     except Exception as e:
-                        logger.error("Failed to insert new session in DB: %s", e)
+                        logger.error("Failed to insert new chat in DB: %s", e)
                 else:
-                    logger.debug("No session_id in payload; skipping new-session insert (payload=%s)", payload)
+                    logger.debug("No chat_id in payload; skipping new-chat insert (payload=%s)", payload)
 
                 continue
 
