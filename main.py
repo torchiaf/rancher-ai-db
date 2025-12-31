@@ -58,6 +58,7 @@ def tables_init():
                 role VARCHAR(32),
                 message LONGTEXT,
                 context LONGTEXT,
+                tags VARCHAR(255),
                 created_at NUMERIC(20),
                 PRIMARY KEY (chat_id, request_id, role)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -80,16 +81,16 @@ def insert_or_update_chat(chat_id, user_id, active=True, name="", timestamp=None
     finally:
         conn.close()
 
-def insert_or_update_message(chat_id, request_id, role, text, context=None, timestamp=None):
+def insert_or_update_message(chat_id, request_id, role, text, context=None, tags=None, timestamp=None):
     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
     try:
         with conn.cursor() as cur:
             # Insert or update message by appending text
             cur.execute(
-                "INSERT INTO messages (chat_id, request_id, role, message, context, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE role=%s, message=CONCAT(COALESCE(message,''), %s), context=%s, created_at=%s",
-                (chat_id, request_id, role, text, context, timestamp, role, text, context, timestamp)
+                "INSERT INTO messages (chat_id, request_id, role, message, context, tags, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE role=%s, message=CONCAT(COALESCE(message,''), %s), context=%s, tags=%s, created_at=%s",
+                (chat_id, request_id, role, text, context, tags, timestamp, role, text, context, tags, timestamp)
             )
 
         conn.commit()
@@ -225,7 +226,15 @@ async def run():
                     payload = {}
                 if payload:
                     try:
-                        insert_or_update_message(chat_id, request_id, payload.get("role"), payload.get("text"), payload.get("context"), payload.get("ts"))
+                        insert_or_update_message(
+                            chat_id,
+                            request_id,
+                            payload.get("role"),
+                            payload.get("text"),
+                            payload.get("context"),
+                            payload.get("tags"),
+                            payload.get("ts")
+                        )
                         logger.debug("Updated message into DB: %s %s %s", chat_id, request_id, payload)
                     except Exception as e:
                         logger.error("DB insert failed: %s", e)
