@@ -66,15 +66,15 @@ def tables_init():
         conn.commit()
     conn.close()
 
-def insert_or_update_chat(chat_id, user_id, active=True, name="", timestamp=None):
+def insert_or_update_chat(chat_id, user_id, active=1, name="", timestamp=None):
     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO chats (chat_id, user_id, active, name, created_at) "
                 "VALUES (%s, %s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE active=%s, name=%s",
-                (chat_id, user_id, active, name, timestamp, active, name)
+                "ON DUPLICATE KEY UPDATE active=%s, name=COALESCE(NULLIF(%s, ''), name), created_at=COALESCE(%s, created_at)",
+                (chat_id, user_id, active, name, timestamp, active, name, timestamp)
             )
 
             conn.commit()
@@ -97,17 +97,26 @@ def insert_or_update_message(chat_id, request_id, role, text, context=None, tags
     finally:
         conn.close()
 
-def _get_previous_chat_for_user(r, user_id):
-    key = f"chats:u-{user_id}"
+async def get_chats():
+    conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
+    chats = []
     try:
-        vals = r.lrange(key, 0, -1)
-
-        if len(vals) >= 2:
-            return json.loads(vals[-2])
-    except Exception as e:
-        logger.debug("Error reading previous chat for user %s: %s", user_id, e)
-
-    return None
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT chat_id, user_id, active, name, created_at FROM chats",
+            )
+            res = cur.fetchall()
+            for row in res:
+                chats.append({
+                    "chat_id": row[0],
+                    "user_id": row[1],
+                    "active": row[2],
+                    "name": row[3],
+                    "created_at": row[4],
+                })
+    finally:
+        conn.close()
+    return chats
 
 async def get_chat_messages(chat_id):
     messages = []
@@ -127,12 +136,40 @@ async def get_chat_messages(chat_id):
             conn.close()
     return messages
 
+async def assign_name_to_previous_chats(user_id: str, active_chat_id: str, max_messages: int = 5):
+    """
+    Assign a name to a chat.
+    """
+    chats = await get_chats()
+    
+    for chat in chats:
+        if chat["user_id"] == user_id and chat["chat_id"] != active_chat_id and not chat["name"]:
+            logger.debug("Assigning name to chat %s for user %s", chat["chat_id"], user_id)
+            await assign_name_to_chat(user_id, chat_id=chat["chat_id"], chat=chat, max_messages=max_messages)
+    
+async def assign_name_to_chat(user_id: str, chat_id: str, chat, max_messages: int = 5):
+    name = None
+
+    try:
+        messages = await get_chat_messages(chat_id)
+        if messages:
+            name = await get_chat_summary(messages[:max_messages])
+    except Exception as e:
+        logger.debug("Failed to obtain name from websocket summary service: %s", e)
+
+    if name:
+        try:
+            insert_or_update_chat(chat_id=chat_id, user_id=user_id, active=chat["active"], name=name, timestamp=chat["created_at"])
+            logger.info("Updated chat %s for user %s with name='%s'", chat_id, user_id, name)
+        except Exception as e:
+            logger.error("Failed to update chat in DB: %s", e)
+
 async def get_chat_summary(messages):
     try:
         async with websockets.connect(AGENT_WS_SUMMARY_URL) as ws:
             text = "\n" + "\n".join(f"- {str(m)}" for m in messages) + "\n"
 
-            logger.info("Sending request to summary service %s", text)
+            logger.info("Sending summary request with text: '%s'", text)
 
             await ws.send(text)
 
@@ -254,29 +291,19 @@ async def run():
                 chat_id = payload.get("chat_id")
                 if chat_id:
                     try:
-                        insert_or_update_chat(chat_id, user_id, active=payload.get("active", True), name=payload.get("name", ""), timestamp=payload.get("created_at"))
-                        logger.debug("Inserted new chat %s for user %s", chat_id, user_id)
+                        is_active = payload.get("active", 1)
 
-                        # Check previous chat for missing name
-                        prev_chat = _get_previous_chat_for_user(r, user_id)
-
-                        # Try to get the chat summary from websocket summary service
-                        name_for_previous = None
-                        if prev_chat:
-                            try:
-                                messages = await get_chat_messages(prev_chat["chat_id"])
-                                if messages:
-                                    name_for_previous = await get_chat_summary(messages)
-                            except Exception as e:
-                                logger.debug("Failed to obtain name from websocket summary service: %s", e)
-
-                        # TODO prev_chat.get("name", None) should be checked in the DB too
-                        if prev_chat and not prev_chat.get("name", None) and name_for_previous:
-                            try:
-                                insert_or_update_chat(prev_chat["chat_id"], user_id, active=True, name=name_for_previous, timestamp=prev_chat["created_at"])
-                                logger.info("Updated previous chat %s for user %s with name=%s", prev_chat["chat_id"], user_id, name_for_previous)
-                            except Exception as e:
-                                logger.error("Failed to update previous chat in DB: %s", e)
+                        insert_or_update_chat(
+                            chat_id,
+                            user_id,
+                            active=is_active,
+                            name=payload.get("name", ""),
+                            timestamp=payload.get("created_at")
+                        )
+                        logger.info("Inserted/Updated chat into DB: %s for user %s with payload %s", chat_id, user_id, payload)
+                        
+                        if is_active:
+                            await assign_name_to_previous_chats(user_id, chat_id)
 
                     except Exception as e:
                         logger.error("Failed to insert new chat in DB: %s", e)
