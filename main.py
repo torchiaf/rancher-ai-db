@@ -145,9 +145,9 @@ async def assign_name_to_previous_chats(user_id: str, active_chat_id: str, max_m
     for chat in chats:
         if chat["user_id"] == user_id and chat["chat_id"] != active_chat_id and not chat["name"]:
             logger.debug("Assigning name to chat %s for user %s", chat["chat_id"], user_id)
-            await assign_name_to_chat(user_id, chat_id=chat["chat_id"], chat=chat, max_messages=max_messages)
+            await assign_name_to_chat(user_id, chat_id=chat["chat_id"], max_messages=max_messages)
     
-async def assign_name_to_chat(user_id: str, chat_id: str, chat, max_messages: int = 5):
+async def assign_name_to_chat(user_id: str, chat_id: str, max_messages: int = 5):
     name = None
 
     try:
@@ -159,7 +159,7 @@ async def assign_name_to_chat(user_id: str, chat_id: str, chat, max_messages: in
 
     if name:
         try:
-            insert_or_update_chat(chat_id=chat_id, user_id=user_id, active=chat["active"], name=name, timestamp=chat["created_at"])
+            insert_or_update_chat(chat_id=chat_id, user_id=user_id, name=name)
             logger.info("Updated chat %s for user %s with name='%s'", chat_id, user_id, name)
         except Exception as e:
             logger.error("Failed to update chat in DB: %s", e)
