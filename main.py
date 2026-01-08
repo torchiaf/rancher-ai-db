@@ -334,7 +334,16 @@ async def run():
                     try:
                         is_active = payload.get("active", 1)
                         
-                        if not is_active:
+                        if is_active:
+                            insert_or_update_chat(
+                                chat_id,
+                                user_id,
+                                active=is_active,
+                                name=payload.get("name", ""),
+                                timestamp=payload.get("created_at")
+                            )
+                            logger.debug("Inserted/Updated chat into DB: %s for user %s with payload %s", chat_id, user_id, payload)
+                        else:
                             updated_chat = update_chat(
                                 chat_id,
                                 user_id,
@@ -352,15 +361,6 @@ async def run():
                                         name=name
                                     )
                                     logger.debug("Updated chat name to: %s for chat %s user %s", name, chat_id, user_id)
-                        else:
-                            insert_or_update_chat(
-                                chat_id,
-                                user_id,
-                                active=is_active,
-                                name=payload.get("name", ""),
-                                timestamp=payload.get("created_at")
-                            )
-                            logger.debug("Inserted/Updated chat into DB: %s for user %s with payload %s", chat_id, user_id, payload)
 
                     except Exception as e:
                         logger.error("Failed to insert new chat in DB: %s", e)
