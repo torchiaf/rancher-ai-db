@@ -96,6 +96,37 @@ def insert_or_update_message(chat_id, request_id, role, text, context=None, tags
         conn.commit()
     finally:
         conn.close()
+        
+def update_chat(chat_id, user_id, active=None, name=None, timestamp=None):
+    conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
+    updated_rows = 0
+    try:
+        with conn.cursor() as cur:
+            updates = []
+            params = []
+            if active is not None:
+                updates.append("active=%s")
+                params.append(active)
+            if name is not None:
+                updates.append("name=%s")
+                params.append(name)
+            if timestamp is not None:
+                updates.append("created_at=%s")
+                params.append(timestamp)
+            params.extend([chat_id, user_id])
+            
+            logger.debug("--- Updating chat %s for user %s with params %s", chat_id, user_id, params)
+
+            if updates:
+                sql = "UPDATE chats SET " + ", ".join(updates) + " WHERE chat_id=%s AND user_id=%s"
+                cur.execute(sql, tuple(params))
+                conn.commit()
+                
+                updated_rows =cur.rowcount
+    finally:
+        conn.close()
+        
+    return updated_rows
 
 async def get_chats():
     conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
@@ -118,6 +149,28 @@ async def get_chats():
         conn.close()
     return chats
 
+async def get_chat_by_id(chat_id):
+    conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DB)
+    chat = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT chat_id, user_id, active, name, created_at FROM chats WHERE chat_id=%s",
+                (chat_id,)
+            )
+            row = cur.fetchone()
+            if row:
+                chat = {
+                    "chat_id": row[0],
+                    "user_id": row[1],
+                    "active": row[2],
+                    "name": row[3],
+                    "created_at": row[4],
+                }
+    finally:
+        conn.close()
+    return chat
+
 async def get_chat_messages(chat_id):
     messages = []
     if chat_id:
@@ -136,19 +189,11 @@ async def get_chat_messages(chat_id):
             conn.close()
     return messages
 
-async def assign_name_to_previous_chats(user_id: str, active_chat_id: str, max_messages: int = 5):
+async def get_chat_name(chat_id: str, max_messages: int = 5):
     """
-    Assign a name to a chat.
+    Obtain a chat name by summarizing its messages via the WebSocket summary service.
     """
-    chats = await get_chats()
-    
-    for chat in chats:
-        if chat["user_id"] == user_id and chat["chat_id"] != active_chat_id and not chat["name"]:
-            logger.debug("Assigning name to chat %s for user %s", chat["chat_id"], user_id)
-            await assign_name_to_chat(user_id, chat_id=chat["chat_id"], max_messages=max_messages)
-    
-async def assign_name_to_chat(user_id: str, chat_id: str, max_messages: int = 5):
-    name = None
+    name = ""
 
     try:
         messages = await get_chat_messages(chat_id)
@@ -157,12 +202,7 @@ async def assign_name_to_chat(user_id: str, chat_id: str, max_messages: int = 5)
     except Exception as e:
         logger.debug("Failed to obtain name from websocket summary service: %s", e)
 
-    if name:
-        try:
-            insert_or_update_chat(chat_id=chat_id, user_id=user_id, name=name)
-            logger.info("Updated chat %s for user %s with name='%s'", chat_id, user_id, name)
-        except Exception as e:
-            logger.error("Failed to update chat in DB: %s", e)
+    return name
 
 async def get_chat_summary(messages):
     try:
@@ -277,6 +317,7 @@ async def run():
                         logger.error("DB insert failed: %s", e)
                 continue
 
+            # Chat channel
             m2 = key_pattern_chat.match(channel)
             if m2:
                 user_id = m2.group("user")
@@ -292,18 +333,34 @@ async def run():
                 if chat_id:
                     try:
                         is_active = payload.get("active", 1)
-
-                        insert_or_update_chat(
-                            chat_id,
-                            user_id,
-                            active=is_active,
-                            name=payload.get("name", ""),
-                            timestamp=payload.get("created_at")
-                        )
-                        logger.info("Inserted/Updated chat into DB: %s for user %s with payload %s", chat_id, user_id, payload)
                         
-                        if is_active:
-                            await assign_name_to_previous_chats(user_id, chat_id)
+                        if not is_active:
+                            updated_chat = update_chat(
+                                chat_id,
+                                user_id,
+                                active=is_active,
+                                timestamp=payload.get("created_at")
+                            )
+                            logger.debug("Updated chat to inactive, rows affected: %d for chat %s user %s", updated_chat, chat_id, user_id)
+
+                            if updated_chat > 0:
+                                name = await get_chat_name(chat_id=chat_id)
+                                if name:
+                                    update_chat(
+                                        chat_id,
+                                        user_id,
+                                        name=name
+                                    )
+                                    logger.debug("Updated chat name to: %s for chat %s user %s", name, chat_id, user_id)
+                        else:
+                            insert_or_update_chat(
+                                chat_id,
+                                user_id,
+                                active=is_active,
+                                name=payload.get("name", ""),
+                                timestamp=payload.get("created_at")
+                            )
+                            logger.debug("Inserted/Updated chat into DB: %s for user %s with payload %s", chat_id, user_id, payload)
 
                     except Exception as e:
                         logger.error("Failed to insert new chat in DB: %s", e)
